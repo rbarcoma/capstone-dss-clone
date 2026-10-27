@@ -12,12 +12,16 @@ use App\Models\Report;
 
 class ReportGenerator
 {
-    public static function create(?int $userId = null, string $source = 'manual'): Report
+    public static function create(?int $userId = null, string $source = 'manual', ?ForecastResult $forecast = null): Report
     {
-        $forecast = ForecastResult::latest('predicted_at')->first();
-        $dss = DssResult::latest('updated_at')->first();
+        $forecast ??= ForecastResult::latest('predicted_at')->latest('id')->first();
+        $dss = $forecast ? DssResult::where('forecast_result_id', $forecast->id)->first() : null;
         $dataset = Dataset::with('user:id,name')->latest()->first();
-        $latestProcessed = ProcessedRecord::query()
+        $history = ProcessedRecord::query();
+        if ($forecast) {
+            $history->whereRaw('(year * 12 + month) < ?', [$forecast->year * 12 + $forecast->month]);
+        }
+        $latestProcessed = (clone $history)
             ->orderByDesc('year')
             ->orderByDesc('month')
             ->first();
@@ -25,12 +29,12 @@ class ReportGenerator
         $processedCount = ProcessedRecord::count();
         $monthlyRecordCount = ConsumptionRecord::count();
         $latestPeriod = $latestProcessed
-            ? $latestProcessed->year . '-' . str_pad((string) $latestProcessed->month, 2, '0', STR_PAD_LEFT)
+            ? $latestProcessed->year.'-'.str_pad((string) $latestProcessed->month, 2, '0', STR_PAD_LEFT)
             : null;
         $forecastPeriod = $forecast
-            ? $forecast->year . '-' . str_pad((string) $forecast->month, 2, '0', STR_PAD_LEFT)
+            ? $forecast->year.'-'.str_pad((string) $forecast->month, 2, '0', STR_PAD_LEFT)
             : null;
-        $averageConsumption = round((float) ProcessedRecord::avg('consumption_kwh'), 2);
+        $averageConsumption = round((float) (clone $history)->avg('consumption_kwh'), 2);
         $r2Score = (float) ($forecast?->r2_score ?? 0);
         $demandRatio = $averageConsumption > 0 && $forecast
             ? round(((float) $forecast->predicted_consumption_kwh / $averageConsumption) * 100, 2)
@@ -84,7 +88,8 @@ class ReportGenerator
                 'prediction_explanation' => [
                     'model' => $forecast?->model_type ?? 'Linear Regression',
                     'forecast_period' => $forecastPeriod,
-                    'description' => 'The system uses Linear Regression. Daily uploaded records are aggregated into monthly records, preprocessing creates lag, trend, and seasonal features, and the trained coefficients are applied to the next-month feature values. The sum of the intercept and weighted feature values becomes the predicted monthly consumption.',
+                    'dataset_hash' => $forecast?->dataset_hash,
+                    'description' => 'The system uses Linear Regression. Daily uploaded records are aggregated into monthly records, preprocessing creates lag, trend, and seasonal features, and the trained coefficients are applied only to the month immediately after the latest consecutive complete, valid actual month in the dataset, independently of the current date. The sum of the intercept and weighted feature values becomes the predicted monthly consumption.',
                     'features' => [
                         'year',
                         'month',
@@ -102,9 +107,9 @@ class ReportGenerator
                 ],
                 'dss_reasoning' => [
                     'demand_reason' => $demandRatio
-                        ? 'The predicted consumption is ' . $demandRatio . '% of the historical average consumption, which supports the ' . ($dss?->demand_status ?? 'No demand status') . ' classification.'
+                        ? 'The predicted consumption is '.$demandRatio.'% of the historical average consumption, which supports the '.($dss?->demand_status ?? 'No demand status').' classification.'
                         : 'Demand reasoning is unavailable because forecast or average consumption data is incomplete.',
-                    'readiness_reason' => 'Readiness is based on solar irradiance, peak demand, and predicted consumption. The current DSS result classified readiness as ' . ($dss?->readiness_level ?? 'No readiness assessment') . '.',
+                    'readiness_reason' => 'Readiness is based on solar irradiance, peak demand, and predicted consumption. The current DSS result classified readiness as '.($dss?->readiness_level ?? 'No readiness assessment').'.',
                 ],
                 'statuses' => [
                     'data_status' => $processedCount > 0 ? 'Preprocessed' : 'Pending',

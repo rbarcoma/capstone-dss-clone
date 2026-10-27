@@ -1,0 +1,15 @@
+# Only runtime build inputs belong in the Docker context.
+**
+!docker/
+!docker/8.5/
+!docker/8.5/Dockerfile
+!Python/
+!Python/requirements.txt
+!vendor/
+!vendor/laravel/
+!vendor/laravel/sail/
+!vendor/laravel/sail/runtimes/
+!vendor/laravel/sail/runtimes/8.5/
+!vendor/laravel/sail/runtimes/8.5/start-container
+!vendor/laravel/sail/runtimes/8.5/supervisord.conf
+!vendor/laravel/sail/runtimes/8.5/php.ini

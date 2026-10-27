@@ -16,7 +16,7 @@ class DashboardController extends Controller
     public function __invoke()
     {
         $latestProcessed = ProcessedRecord::query()->orderByDesc('year')->orderByDesc('month')->first();
-        $latestForecast = ForecastResult::latest('predicted_at')->first();
+        $latestForecast = ForecastResult::latest('predicted_at')->latest('id')->first();
         $latestDss = DssResult::query()
             ->whereNotNull('forecast_result_id')
             ->latest('updated_at')
@@ -38,10 +38,10 @@ class DashboardController extends Controller
                 'latest_average_consumption' => round((float) ($latestProcessed?->consumption_kwh ?? 0), 2),
                 'latest_predicted_consumption' => round((float) ($latestForecast?->predicted_consumption_kwh ?? 0), 2),
                 'latest_period' => $latestProcessed
-                    ? $latestProcessed->year . '-' . str_pad((string) $latestProcessed->month, 2, '0', STR_PAD_LEFT)
+                    ? $latestProcessed->year.'-'.str_pad((string) $latestProcessed->month, 2, '0', STR_PAD_LEFT)
                     : 'No data',
                 'forecast_period' => $latestForecast
-                    ? $latestForecast->year . '-' . str_pad((string) $latestForecast->month, 2, '0', STR_PAD_LEFT)
+                    ? $latestForecast->year.'-'.str_pad((string) $latestForecast->month, 2, '0', STR_PAD_LEFT)
                     : 'No forecast',
                 'forecast_change_percent' => round((float) ($latestForecast?->change_percent ?? 0), 2),
                 'previous_consumption' => round((float) ($latestForecast?->previous_consumption_kwh ?? 0), 2),
@@ -54,7 +54,7 @@ class DashboardController extends Controller
                 'forecasts' => ForecastResult::count(),
                 'reports' => Report::count(),
             ],
-            'recentForecasts' => ForecastResult::latest('predicted_at')->take(5)->get(),
+            'recentForecasts' => ForecastResult::latest('predicted_at')->latest('id')->take(5)->get(),
             'recentReports' => Report::latest()->take(5)->get(),
             'recentDatasets' => Dataset::latest()->take(5)->get(),
             'trend' => $trend,

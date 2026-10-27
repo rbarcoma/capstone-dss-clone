@@ -2,10 +2,12 @@
 
 namespace App\Support;
 
+use App\Models\DssResult;
 use App\Models\ForecastResult;
-use App\Models\ProcessedRecord;
 use App\Models\Report;
-use Illuminate\Support\Carbon;
+use Illuminate\Support\Collection;
+use Illuminate\Support\Facades\Cache;
+use Illuminate\Support\Facades\DB;
 use Illuminate\Support\Facades\Process;
 use Illuminate\Support\Facades\Storage;
 use RuntimeException;
@@ -13,17 +15,84 @@ use RuntimeException;
 class MlWorkflow
 {
     private const DATASET_PATH = 'ml/processed_dataset.csv';
+
     private const STATE_PATH = 'ml/model_state.json';
 
     public function trainIfDatasetChanged(?int $userId = null, bool $force = false): array
     {
-        $this->exportProcessedDataset();
+        $snapshot = ForecastDataset::snapshot();
 
-        $hash = hash_file('sha256', Storage::path(self::DATASET_PATH));
+        return $this->trainSnapshot($snapshot, $userId, $force);
+    }
+
+    /** Fitted historical estimates, kept separate from saved next-month forecasts. */
+    public function historicalPredictions(): Collection
+    {
+        // Validate the upload even when predictions have already been cached.
+        $snapshot = ForecastDataset::snapshot();
+        if ($snapshot['records']->count() < 6) {
+            return collect();
+        }
+
+        return Cache::lock('dataset-next-month-forecast', 180)->block(5, function () use ($snapshot) {
+            if (ForecastDataset::snapshot()['dataset_hash'] !== $snapshot['dataset_hash']) {
+                throw new RuntimeException('The uploaded dataset changed during historical prediction.');
+            }
+            $path = 'ml/history/'.$snapshot['dataset_hash'].'.json';
+            if (Storage::exists($path)) {
+                $cached = json_decode(Storage::get($path), true);
+                if (is_array($cached)) {
+                    return collect($cached)->keyBy('period');
+                }
+            }
+
+            // Existing uploads may predate historical estimates. Train only from this
+            // validated snapshot, never from a bundled or stale model/export.
+            $this->trainSnapshot($snapshot, null);
+            $result = $this->runPython(
+                'predict_history.py',
+                $this->modelPathForHash($snapshot['dataset_hash']),
+                $this->metricsPathForHash($snapshot['dataset_hash']),
+                'ml/datasets/'.$snapshot['dataset_hash'].'.csv',
+            );
+            if ($result->failed()) {
+                throw new RuntimeException($result->errorOutput() ?: $result->output());
+            }
+
+            $predictions = json_decode(trim($result->output()), true);
+            $periods = $snapshot['records']->map(fn ($row) => sprintf('%04d-%02d', $row->year, $row->month))->all();
+            if (! is_array($predictions) || ! array_is_list($predictions)
+                || array_column($predictions, 'period') !== $periods) {
+                throw new RuntimeException('Historical predictions do not match the uploaded dataset periods.');
+            }
+            foreach ($predictions as $prediction) {
+                if (! is_numeric($prediction['predicted'] ?? null)
+                    || ! is_finite((float) $prediction['predicted']) || (float) $prediction['predicted'] < 0) {
+                    throw new RuntimeException('Historical prediction contains an invalid consumption value.');
+                }
+            }
+            if (ForecastDataset::snapshot()['dataset_hash'] !== $snapshot['dataset_hash']) {
+                throw new RuntimeException('The uploaded dataset changed during historical prediction.');
+            }
+
+            Storage::put($path, json_encode($predictions, JSON_THROW_ON_ERROR));
+
+            return collect($predictions)->keyBy('period');
+        });
+    }
+
+    private function trainSnapshot(array $snapshot, ?int $userId, bool $force = false): array
+    {
+        if ($snapshot['records']->count() < 6) {
+            throw new RuntimeException('At least 6 consecutive complete processed months are required for forecasting.');
+        }
+        $hash = $snapshot['dataset_hash'];
+        $datasetPath = 'ml/datasets/'.$hash.'.csv';
+        Storage::put($datasetPath, ForecastDataset::csv($snapshot['records']));
         $state = $this->modelState();
         $modelPath = $this->modelPathForHash($hash);
         $metricsPath = $this->metricsPathForHash($hash);
-        $modelExists = Storage::exists($modelPath);
+        $modelExists = Storage::exists($modelPath) && Storage::exists($metricsPath);
         $changed = ($state['dataset_hash'] ?? null) !== $hash;
 
         if (! $force && ! $changed && $modelExists) {
@@ -34,10 +103,15 @@ class MlWorkflow
             ];
         }
 
-        $result = $this->runPython('train_model.py', $modelPath, $metricsPath);
+        Storage::makeDirectory(dirname($modelPath));
+        $result = $this->runPython('train_model.py', $modelPath, $metricsPath, $datasetPath);
 
         if ($result->failed()) {
             throw new RuntimeException($result->errorOutput() ?: $result->output());
+        }
+
+        if (! Storage::exists($modelPath) || ! Storage::exists($metricsPath)) {
+            throw new RuntimeException('Training did not produce a model and metrics for the uploaded dataset.');
         }
 
         Storage::put(self::STATE_PATH, json_encode([
@@ -63,20 +137,36 @@ class MlWorkflow
 
     public function predictAndGenerate(?int $userId = null, string $source = 'manual', bool $generateReport = true): array
     {
-        $this->ensureModelAvailable($userId);
+        return Cache::lock('dataset-next-month-forecast', 180)->block(5, function () use ($userId, $source, $generateReport) {
+            return $this->generatePrediction($userId, $source, $generateReport);
+        });
+    }
 
-        $state = $this->modelState();
-        $modelPath = $state['model_path'] ?? null;
-        $metricsPath = $state['metrics_path'] ?? null;
-
-        if (! $modelPath || ! Storage::exists($modelPath)) {
-            $training = $this->trainIfDatasetChanged($userId, true);
-            $state = $this->modelState();
-            $modelPath = $state['model_path'] ?? $this->modelPathForHash($training['dataset_hash']);
-            $metricsPath = $state['metrics_path'] ?? $this->metricsPathForHash($training['dataset_hash']);
+    private function generatePrediction(?int $userId, string $source, bool $generateReport): array
+    {
+        $snapshot = ForecastDataset::snapshot();
+        if ($snapshot['records']->count() < 6) {
+            throw new RuntimeException('At least 6 consecutive complete processed months are required for forecasting.');
+        }
+        // Export only the validated uploaded snapshot.
+        Storage::put(self::DATASET_PATH, ForecastDataset::csv($snapshot['records']));
+        $identity = array_intersect_key($snapshot, array_flip(['dataset_hash', 'year', 'month']));
+        $existing = ForecastResult::where($identity)->first();
+        if ($existing) {
+            return [
+                'forecast' => $existing,
+                'dss' => DssResult::where('forecast_result_id', $existing->id)->first(),
+                'report' => Report::where('summary->latest_forecast->id', $existing->id)->latest('id')->first(),
+            ];
         }
 
-        $result = $this->runPython('predict_next_month.py', $modelPath, $metricsPath);
+        // Use an immutable snapshot so simultaneous exports cannot change prediction input.
+        $datasetPath = 'ml/datasets/'.$snapshot['dataset_hash'].'.csv';
+        Storage::put($datasetPath, ForecastDataset::csv($snapshot['records']));
+        $this->trainSnapshot($snapshot, $userId);
+        $modelPath = $this->modelPathForHash($snapshot['dataset_hash']);
+        $metricsPath = $this->metricsPathForHash($snapshot['dataset_hash']);
+        $result = $this->runPython('predict_next_month.py', $modelPath, $metricsPath, $datasetPath);
 
         if ($result->failed()) {
             throw new RuntimeException($result->errorOutput() ?: $result->output());
@@ -84,76 +174,76 @@ class MlWorkflow
 
         $data = json_decode(trim($result->output()), true);
 
-        if (! $data) {
+        if (! is_array($data) || $data === []) {
             throw new RuntimeException('Invalid JSON output from Python prediction script.');
+        }
+
+        if (($data['year'] ?? null) !== $snapshot['year'] || ($data['month'] ?? null) !== $snapshot['month']
+            || ! is_numeric($data['predicted_consumption_kwh'] ?? null)
+            || ! is_finite((float) $data['predicted_consumption_kwh'])
+            || (float) $data['predicted_consumption_kwh'] < 0) {
+            throw new RuntimeException('Prediction does not match the immediate next dataset month or contains an invalid value.');
         }
 
         $generatedAt = now();
 
-        $forecast = ForecastResult::updateOrCreate([
-            'year' => $data['year'],
-            'month' => $data['month'],
-        ], [
-            'user_id' => $userId,
-            'predicted_at' => $generatedAt,
-            'predicted_consumption_kwh' => $data['predicted_consumption_kwh'],
-            'previous_consumption_kwh' => $data['previous_consumption_kwh'] ?? null,
-            'change_percent' => $data['change_percent'] ?? null,
-            'mae' => $data['mae'] ?? null,
-            'rmse' => $data['rmse'] ?? null,
-            'r2_score' => $data['r2_score'] ?? null,
-            'model_type' => $data['model_type'] ?? 'Linear Regression',
-        ]);
-
-        $dss = EnergyDss::generateForForecast($forecast, $userId, $generatedAt);
-        $report = $generateReport ? ReportGenerator::create($userId, $source) : null;
-
-        AuditLogger::log(
-            'Forecasting',
-            $source === 'manual' ? 'Generate Prediction' : 'Auto Generate Prediction',
-            'Generated next-month prediction for ' .
-                $forecast->year . '-' .
-                str_pad((string) $forecast->month, 2, '0', STR_PAD_LEFT) .
-                ': ' . $forecast->predicted_consumption_kwh . ' kWh.'
-        );
-
-        AuditLogger::log(
-            'Decision Support',
-            $source === 'manual' ? 'Auto Generate DSS Result' : 'System Generate DSS Result',
-            'Generated DSS result: ' . $dss->demand_status . ' and ' . $dss->readiness_level . '.'
-        );
-
-        if ($report instanceof Report) {
-            AuditLogger::log(
-                'Reports',
-                $source === 'manual' ? 'Generate Report' : 'Auto Generate Report',
-                'Generated report: ' . $report->title . '.'
-            );
+        if (ForecastDataset::snapshot()['dataset_hash'] !== $snapshot['dataset_hash']) {
+            throw new RuntimeException('The uploaded dataset changed during forecasting. Generate the forecast again.');
         }
 
-        return [
-            'forecast' => $forecast,
-            'dss' => $dss,
-            'report' => $report,
-        ];
+        return DB::transaction(function () use ($identity, $data, $userId, $generatedAt, $generateReport, $source) {
+            $forecast = ForecastResult::firstOrCreate($identity, [
+                'user_id' => $userId,
+                'predicted_at' => $generatedAt,
+                'predicted_consumption_kwh' => $data['predicted_consumption_kwh'],
+                'previous_consumption_kwh' => $data['previous_consumption_kwh'] ?? null,
+                'change_percent' => $data['change_percent'] ?? null,
+                'mae' => $data['mae'] ?? null,
+                'rmse' => $data['rmse'] ?? null,
+                'r2_score' => $data['r2_score'] ?? null,
+                'model_type' => $data['model_type'] ?? 'Linear Regression',
+            ]);
+
+            $dss = EnergyDss::generateForForecast($forecast, $userId, $generatedAt);
+            $report = $generateReport ? ReportGenerator::create($userId, $source, $forecast) : null;
+
+            AuditLogger::log(
+                'Forecasting',
+                $source === 'manual' ? 'Generate Prediction' : 'Auto Generate Prediction',
+                'Generated next-month prediction for '.
+                    $forecast->year.'-'.
+                    str_pad((string) $forecast->month, 2, '0', STR_PAD_LEFT).
+                    ': '.$forecast->predicted_consumption_kwh.' kWh.'
+            );
+
+            AuditLogger::log(
+                'Decision Support',
+                $source === 'manual' ? 'Auto Generate DSS Result' : 'System Generate DSS Result',
+                'Generated DSS result: '.$dss->demand_status.' and '.$dss->readiness_level.'.'
+            );
+
+            if ($report instanceof Report) {
+                AuditLogger::log(
+                    'Reports',
+                    $source === 'manual' ? 'Generate Report' : 'Auto Generate Report',
+                    'Generated report: '.$report->title.'.'
+                );
+            }
+
+            return [
+                'forecast' => $forecast,
+                'dss' => $dss,
+                'report' => $report,
+            ];
+        });
     }
 
     public function runAfterDatasetUpload(?int $userId = null): array
     {
-        $training = $this->trainIfDatasetChanged($userId);
-
-        if (! $training['trained']) {
-            return [
-                'trained' => false,
-                'predicted' => false,
-                'message' => $training['reason'],
-            ];
-        }
-
         $result = $this->predictAndGenerate($userId, 'dataset_upload');
 
         return [
-            'trained' => true,
+            'trained' => false,
             'predicted' => true,
             'forecast' => $result['forecast'],
             'dss' => $result['dss'],
@@ -163,79 +253,17 @@ class MlWorkflow
 
     public function runScheduledMonthlyPrediction(): array
     {
-        $this->trainIfDatasetChanged(null);
-
         return $this->predictAndGenerate(null, 'monthly_cron');
     }
 
-    private function ensureModelAvailable(?int $userId = null): void
+    private function runPython(string $script, string $modelPath, string $metricsPath, ?string $datasetPath = null)
     {
-        $this->exportProcessedDataset();
-
-        $state = $this->modelState();
-        $modelPath = $state['model_path'] ?? null;
-
-        if (! $modelPath || ! Storage::exists($modelPath)) {
-            $this->trainIfDatasetChanged($userId, true);
-        }
-    }
-
-    private function exportProcessedDataset(): void
-    {
-        $records = ProcessedRecord::query()
-            ->orderBy('year')
-            ->orderBy('month')
-            ->get();
-
-        if ($records->count() < 6) {
-            throw new RuntimeException('At least 6 processed records are required for forecasting.');
-        }
-
-        Storage::makeDirectory('ml');
-
-        $headers = [
-            'year',
-            'month',
-            'consumption_kwh',
-            'temperature',
-            'humidity',
-            'rainfall',
-            'solar_irradiance',
-            'peak_demand_kw',
-            'lag_1',
-            'lag_2',
-            'trend',
-            'month_sin',
-            'month_cos',
-        ];
-
-        $lines = [implode(',', $headers)];
-
-        foreach ($records as $record) {
-            $lines[] = implode(',', array_map(
-                fn ($field) => $record->{$field},
-                $headers
-            ));
-        }
-
-        Storage::put(self::DATASET_PATH, implode(PHP_EOL, $lines));
-    }
-
-    private function runPython(string $script, string $modelPath, string $metricsPath)
-    {
-        $python = file_exists(base_path('venv314/Scripts/python.exe'))
-            ? base_path('venv314/Scripts/python.exe')
-            : 'python';
-
-        Storage::makeDirectory(dirname($modelPath));
-        Storage::makeDirectory(dirname($metricsPath));
-
         return Process::path(base_path('Python'))->run([
-            $python,
+            config('ml.python'),
             $script,
-            Storage::path(self::DATASET_PATH),
-            Storage::path($modelPath),
-            Storage::path($metricsPath),
+            Storage::path($datasetPath ?? self::DATASET_PATH),
+            str_starts_with($modelPath, base_path()) ? $modelPath : Storage::path($modelPath),
+            str_starts_with($metricsPath, base_path()) ? $metricsPath : Storage::path($metricsPath),
         ]);
     }
 
@@ -250,11 +278,11 @@ class MlWorkflow
 
     private function modelPathForHash(string $hash): string
     {
-        return 'ml/models/qc_energy_model_' . substr($hash, 0, 16) . '.pkl';
+        return 'ml/models/qc_energy_model_'.substr($hash, 0, 16).'.pkl';
     }
 
     private function metricsPathForHash(string $hash): string
     {
-        return 'ml/models/metrics_' . substr($hash, 0, 16) . '.json';
+        return 'ml/models/metrics_'.substr($hash, 0, 16).'.json';
     }
 }

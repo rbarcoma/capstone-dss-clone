@@ -1,0 +1,12 @@
+# Python 3.12 runtime, including transitive dependencies.
+# Match the versions recorded in the existing sklearn and XGBoost model pickles.
+numpy==2.3.5
+scipy==1.16.3
+scikit-learn==1.8.0
+joblib==1.5.3
+threadpoolctl==3.6.0
+# Avoid unused CUDA dependencies on Linux amd64; ARM64 uses the standard wheel.
+xgboost-cpu==3.2.0; sys_platform == "linux" and platform_machine == "x86_64"
+xgboost==3.2.0; sys_platform != "linux" or platform_machine != "x86_64"
+# The published ARM64 XGBoost wheel declares NCCL even for CPU inference.
+nvidia-nccl-cu12==2.28.9; sys_platform == "linux" and platform_machine != "x86_64"

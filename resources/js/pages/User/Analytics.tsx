@@ -166,7 +166,9 @@ function ActualPredictedChart({
                     <YAxis
                         axisLine={{ stroke: 'var(--border)' }}
                         tick={{ fill: 'var(--muted-foreground)', fontSize: 12 }}
-                        tickFormatter={(value) => formatCompactNumber(Number(value))}
+                        tickFormatter={(value) =>
+                            formatCompactNumber(Number(value))
+                        }
                         tickLine={false}
                     />
                     <Tooltip content={<ActualPredictedTooltip />} />
@@ -255,7 +257,9 @@ function AnalyticsChart({
                     <YAxis
                         axisLine={{ stroke: 'var(--border)' }}
                         tick={{ fill: 'var(--muted-foreground)', fontSize: 12 }}
-                        tickFormatter={(value) => formatCompactNumber(Number(value))}
+                        tickFormatter={(value) =>
+                            formatCompactNumber(Number(value))
+                        }
                         tickLine={false}
                     />
                     <Tooltip
@@ -365,7 +369,11 @@ export default function Analytics({
             <div className="grid gap-4 md:grid-cols-4">
                 <StatCard
                     title="Average Consumption"
-                    value={`${summary?.average_consumption ?? 0} kWh`}
+                    value={
+                        summary?.average_consumption == null
+                            ? 'No data'
+                            : `${summary.average_consumption} kWh`
+                    }
                     onInfoClick={() =>
                         setInfoModal(analyticsInfo.averageConsumption)
                     }
@@ -373,7 +381,11 @@ export default function Analytics({
 
                 <StatCard
                     title="Highest Consumption"
-                    value={`${summary?.highest_consumption ?? 0} kWh`}
+                    value={
+                        summary?.highest_consumption == null
+                            ? 'No data'
+                            : `${summary.highest_consumption} kWh`
+                    }
                     helper={
                         summary?.highest_consumption_year &&
                         summary?.highest_consumption_month
@@ -389,7 +401,11 @@ export default function Analytics({
 
                 <StatCard
                     title="Average Peak Demand"
-                    value={`${summary?.average_peak_demand ?? 0} kW`}
+                    value={
+                        summary?.average_peak_demand == null
+                            ? 'No data'
+                            : `${summary.average_peak_demand} kW`
+                    }
                     onInfoClick={() =>
                         setInfoModal(analyticsInfo.averagePeakDemand)
                     }
@@ -397,7 +413,7 @@ export default function Analytics({
 
                 <StatCard
                     title="Avg Solar Irradiance"
-                    value={summary?.average_solar_irradiance ?? 0}
+                    value={summary?.average_solar_irradiance ?? 'No data'}
                     onInfoClick={() =>
                         setInfoModal(analyticsInfo.averageSolarIrradiance)
                     }
@@ -408,10 +424,15 @@ export default function Analytics({
                 <Card className="rounded-lg xl:col-span-2">
                     <CardHeader className="gap-4 md:flex-row md:items-center md:justify-between">
                         <div>
-                            <CardTitle>Actual vs Predicted Consumption</CardTitle>
+                            <CardTitle>
+                                Actual vs Predicted Consumption
+                            </CardTitle>
                             <p className="mt-1 text-sm text-muted-foreground">
-                                Actual dataset values compared with saved machine
-                                learning forecast results.
+                                Actual consumption compared with historical
+                                model estimates and the saved next-month
+                                forecast. Historical estimates use the training
+                                data and do not measure future forecast
+                                accuracy.
                             </p>
                         </div>
                         <div className="flex flex-wrap items-center gap-3">
@@ -423,15 +444,19 @@ export default function Analytics({
                                     <SelectValue placeholder="Month" />
                                 </SelectTrigger>
                                 <SelectContent>
-                                    <SelectItem value="all">All Months</SelectItem>
-                                    {filterOptions.months.map((month: number) => (
-                                        <SelectItem
-                                            key={month}
-                                            value={String(month)}
-                                        >
-                                            {monthNames[month - 1]}
-                                        </SelectItem>
-                                    ))}
+                                    <SelectItem value="all">
+                                        All Months
+                                    </SelectItem>
+                                    {filterOptions.months.map(
+                                        (month: number) => (
+                                            <SelectItem
+                                                key={month}
+                                                value={String(month)}
+                                            >
+                                                {monthNames[month - 1]}
+                                            </SelectItem>
+                                        ),
+                                    )}
                                 </SelectContent>
                             </Select>
                             <Select
@@ -442,7 +467,9 @@ export default function Analytics({
                                     <SelectValue placeholder="Year" />
                                 </SelectTrigger>
                                 <SelectContent>
-                                    <SelectItem value="all">All Years</SelectItem>
+                                    <SelectItem value="all">
+                                        All Years
+                                    </SelectItem>
                                     {filterOptions.years.map((year: number) => (
                                         <SelectItem
                                             key={year}

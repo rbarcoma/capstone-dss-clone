@@ -26,41 +26,6 @@ CROSS_VALIDATION_FOLDS = 5
 
 
 
-SCRIPT_DIR = Path(__file__).resolve().parent
-PROJECT_ROOT = SCRIPT_DIR.parent
-STORAGE_ML_DIR = PROJECT_ROOT / "storage" / "app" / "private" / "ml"
-
-
-
-
-def default_path(filename):
-    return SCRIPT_DIR / filename
-
-
-def default_dataset_path():
-    candidates = [
-        STORAGE_ML_DIR / "processed_dataset.csv",
-        SCRIPT_DIR / "qc_final_merged_dataset.csv",
-        SCRIPT_DIR / "sample-data" / "qc_final_merged_dataset.csv",
-    ]
-
-    for candidate in candidates:
-        if candidate.exists():
-            return candidate
-
-    return candidates[0]
-
-
-def default_model_path():
-    return SCRIPT_DIR / "qc_energy_model_final.pkl"
-
-
-def default_metrics_path():
-    return SCRIPT_DIR / "generated_metrics.json"
-
-
-
-
 def log(message):
     print(message, flush=True)
 
@@ -74,7 +39,7 @@ def read_rows(dataset_path):
         for row in reader:
             parsed = {}
             for key, value in row.items():
-                parsed[key] = float(value or 0)
+                parsed[key] = float(value)
             rows.append(parsed)
 
 
@@ -293,9 +258,9 @@ def period_label(row):
 
 
 def main():
-    dataset_path = Path(sys.argv[1]) if len(sys.argv) > 1 else default_dataset_path()
-    model_path = Path(sys.argv[2]) if len(sys.argv) > 2 else default_model_path()
-    metrics_path = Path(sys.argv[3]) if len(sys.argv) > 3 else default_metrics_path()
+    if len(sys.argv) != 4:
+        raise ValueError("Explicit uploaded dataset, model, and metrics paths are required.")
+    dataset_path, model_path, metrics_path = map(Path, sys.argv[1:4])
 
 
     log("Training machine learning model...")

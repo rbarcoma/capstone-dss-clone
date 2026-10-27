@@ -3,7 +3,7 @@
 namespace App\Http\Controllers\Admin;
 
 use App\Http\Controllers\Controller;
-use App\Models\ForecastResult;
+use App\Support\ForecastDataset;
 use App\Support\MlWorkflow;
 use Illuminate\Http\Request;
 use Inertia\Inertia;
@@ -14,8 +14,9 @@ class ForecastingController extends Controller
     public function index()
     {
         return Inertia::render('Admin/Forecasting', [
-            'latestForecast' => ForecastResult::with('user:id,name')->latest('predicted_at')->first(),
-            'forecastHistory' => ForecastResult::with('user:id,name')->latest('predicted_at')->take(20)->get(),
+            'forecastTarget' => ForecastDataset::target(),
+            'latestForecast' => ForecastDataset::currentForecasts()->with('user:id,name')->latest('predicted_at')->latest('id')->first(),
+            'forecastHistory' => ForecastDataset::currentForecasts()->with('user:id,name')->latest('predicted_at')->latest('id')->take(20)->get(),
         ]);
     }
 
@@ -27,18 +28,19 @@ class ForecastingController extends Controller
             return back()->with('error', $exception->getMessage());
         }
 
-        return back()->with('success', 'Model trained successfully. ' . ($result['output'] ?? ''));
+        return back()->with('success', 'Model trained successfully. '.($result['output'] ?? ''));
     }
 
     public function predict(Request $request)
     {
         try {
-            app(MlWorkflow::class)->trainIfDatasetChanged($request->user()?->id);
-            app(MlWorkflow::class)->predictAndGenerate($request->user()?->id, 'manual');
+            $result = app(MlWorkflow::class)->predictAndGenerate($request->user()?->id, 'manual');
         } catch (RuntimeException $exception) {
             return back()->with('error', $exception->getMessage());
         }
 
-        return back()->with('success', 'Next-month forecast, DSS recommendations, and report saved.');
+        $forecast = $result['forecast'];
+
+        return back()->with('success', sprintf('Dataset-based forecast for %04d-%02d is saved with DSS recommendations and report.', $forecast->year, $forecast->month));
     }
 }

@@ -5,10 +5,12 @@ namespace App\Http\Controllers\Admin;
 use App\Http\Controllers\Controller;
 use App\Models\ClimateRecord;
 use App\Models\ConsumptionRecord;
+use App\Models\Dataset;
+use App\Models\ProcessedRecord;
 use App\Support\AuditLogger;
 use App\Support\EnergyPreprocessor;
 use App\Support\MlWorkflow;
-use App\Models\Dataset;
+use App\Support\MonthlyDataQuality;
 use Illuminate\Http\Request;
 use Illuminate\Support\Facades\Hash;
 use Illuminate\Support\Facades\Storage;
@@ -49,7 +51,12 @@ class DataManagementController extends Controller
         $replaceExisting = $request->boolean('replace_existing');
         $originalName = $request->file('dataset')->getClientOriginalName();
         $path = $request->file('dataset')->store('datasets');
-        [$headers, $rows] = $this->readCsv(Storage::path($path));
+        try {
+            [$headers, $rows] = $this->readCsv(Storage::path($path));
+        } catch (ValidationException $exception) {
+            Storage::delete($path);
+            throw $exception;
+        }
         $missing = array_values(array_diff($this->required, $headers));
         $existingDataset = $replaceExisting
             ? Dataset::query()
@@ -79,6 +86,14 @@ class DataManagementController extends Controller
             ]);
 
             return back()->with('error', 'Dataset is invalid. Missing: '.implode(', ', $missing));
+        }
+
+        if ($rows === [] || collect($rows)->contains(fn ($row) => ! MonthlyDataQuality::validValues($row))) {
+            Storage::delete($path);
+
+            throw ValidationException::withMessages([
+                'dataset' => 'Upload a non-empty dataset with valid dates and finite numeric consumption and climate values. Consumption and demand cannot be negative.',
+            ]);
         }
 
         if ($existingDataset) {
@@ -130,6 +145,7 @@ class DataManagementController extends Controller
                 [
                     'dataset_id' => $dataset->id,
                     'consumption_kwh' => $row['consumption_kwh'],
+                    'is_complete' => $row['is_complete'],
                     'peak_demand_kw' => $row['peak_demand_kw'],
                 ]
             );
@@ -154,7 +170,7 @@ class DataManagementController extends Controller
         AuditLogger::log(
             'Data Management',
             $existingDataset ? 'Replace Dataset' : 'Upload Dataset',
-            ($existingDataset ? 'Replaced' : 'Uploaded') . ' combined electricity and climate dataset CSV with ' . $rawCount . ' raw records aggregated into ' . $monthlyCount . ' monthly records.'
+            ($existingDataset ? 'Replaced' : 'Uploaded').' combined electricity and climate dataset CSV with '.$rawCount.' raw records aggregated into '.$monthlyCount.' monthly records.'
         );
 
         try {
@@ -163,22 +179,22 @@ class DataManagementController extends Controller
             AuditLogger::log(
                 'Preprocessing',
                 'Auto Run Preprocessing',
-                $processedCount . ' processed records generated after dataset upload.'
+                $processedCount.' processed records generated after dataset upload.'
             );
 
             $workflow = app(MlWorkflow::class)->runAfterDatasetUpload($request->user()?->id);
             $workflowMessage = $workflow['predicted']
-                ? ' Model retrained, next-month prediction, DSS result, and report generated automatically.'
-                : ' Model retraining was skipped: ' . $workflow['message'];
+                ? ' Dataset-based next-month prediction, DSS result, and report generated using a model trained on the uploaded data.'
+                : ' Forecasting was skipped: '.$workflow['message'];
 
             return back()->with(
                 'success',
-                ($existingDataset ? 'Existing dataset replaced. ' : '') . "{$rawCount} daily records uploaded and aggregated into {$monthlyCount} monthly records. {$processedCount} processed records generated automatically.{$workflowMessage}"
+                ($existingDataset ? 'Existing dataset replaced. ' : '')."{$rawCount} daily records uploaded and aggregated into {$monthlyCount} monthly records. {$processedCount} processed records generated automatically.{$workflowMessage}"
             );
         } catch (RuntimeException $exception) {
             return back()->with(
                 'success',
-                ($existingDataset ? 'Existing dataset replaced. ' : '') . "{$rawCount} daily records uploaded and aggregated into {$monthlyCount} monthly records. Automated workflow was not completed: {$exception->getMessage()}"
+                ($existingDataset ? 'Existing dataset replaced. ' : '')."{$rawCount} daily records uploaded and aggregated into {$monthlyCount} monthly records. Automated workflow was not completed: {$exception->getMessage()}"
             );
         }
     }
@@ -199,12 +215,21 @@ class DataManagementController extends Controller
         $type = $dataset->type;
 
         Storage::delete($dataset->path);
+        ConsumptionRecord::where('dataset_id', $dataset->id)->delete();
+        ClimateRecord::where('dataset_id', $dataset->id)->delete();
         $dataset->delete();
+        // Rebuild lag features from the remaining uploads; never retain orphaned processed rows.
+        ProcessedRecord::query()->delete();
+        try {
+            EnergyPreprocessor::run();
+        } catch (RuntimeException) {
+            // Too few remaining months: leave preprocessing empty until a valid upload is available.
+        }
 
         AuditLogger::log(
             'Data Management',
             'Delete Dataset',
-            'Deleted ' . $type . ' dataset: ' . $fileName . '.'
+            'Deleted '.$type.' dataset: '.$fileName.'.'
         );
 
         return back()->with('success', 'Dataset entry deleted.');
@@ -213,14 +238,22 @@ class DataManagementController extends Controller
     private function readCsv(string $path): array
     {
         $handle = fopen($path, 'r');
-        $headers = array_map(fn ($value) => strtolower(trim($value)), fgetcsv($handle) ?: []);
+        $headers = array_map(fn ($value) => strtolower(trim($value)), fgetcsv($handle, escape: '') ?: []);
+        if (count($headers) !== count(array_unique($headers))) {
+            fclose($handle);
+            throw ValidationException::withMessages(['dataset' => 'CSV column names must be unique.']);
+        }
         $rows = [];
 
-        while (($line = fgetcsv($handle)) !== false) {
+        while (($line = fgetcsv($handle, escape: '')) !== false) {
             if (count(array_filter($line, fn ($value) => $value !== null && $value !== '')) === 0) {
                 continue;
             }
-            $rows[] = array_combine($headers, array_pad($line, count($headers), null));
+            if (count($line) !== count($headers)) {
+                fclose($handle);
+                throw ValidationException::withMessages(['dataset' => 'Every CSV row must match the column headers.']);
+            }
+            $rows[] = array_combine($headers, $line);
         }
 
         fclose($handle);
@@ -233,6 +266,9 @@ class DataManagementController extends Controller
         $groups = [];
 
         foreach ($rows as $row) {
+            if (! MonthlyDataQuality::validPeriod($row)) {
+                continue;
+            }
             $year = (int) $row['year'];
             $month = (int) $row['month'];
             $key = "{$year}-{$month}";
@@ -241,6 +277,7 @@ class DataManagementController extends Controller
                 'year' => $year,
                 'month' => $month,
                 'days' => 0,
+                'source_rows' => [],
                 'consumption_kwh' => 0.0,
                 'peak_demand_kw' => 0.0,
                 'temperature' => 0.0,
@@ -249,6 +286,7 @@ class DataManagementController extends Controller
                 'solar_irradiance' => 0.0,
             ];
 
+            $groups[$key]['source_rows'][] = $row;
             $groups[$key]['days']++;
             $groups[$key]['consumption_kwh'] += (float) $row['consumption_kwh'];
             $groups[$key]['peak_demand_kw'] = max(
@@ -265,6 +303,7 @@ class DataManagementController extends Controller
             ->sortBy([['year', 'asc'], ['month', 'asc']])
             ->map(function (array $group) {
                 return [
+                    'is_complete' => MonthlyDataQuality::isComplete($group['source_rows']),
                     'year' => $group['year'],
                     'month' => $group['month'],
                     'consumption_kwh' => $group['consumption_kwh'],

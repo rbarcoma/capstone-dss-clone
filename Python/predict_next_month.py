@@ -1,65 +1,38 @@
 import csv
-from datetime import date
 import json
 import math
 import os
 import pickle
-import subprocess
 import sys
 from pathlib import Path
 
 
 
 
-SCRIPT_DIR = Path(__file__).resolve().parent
-PROJECT_ROOT = SCRIPT_DIR.parent
-STORAGE_ML_DIR = PROJECT_ROOT / "storage" / "app" / "private" / "ml"
-
-
-
-
-def default_path(filename):
-    return SCRIPT_DIR / filename
-
-
-def default_dataset_path():
-    candidates = [
-        STORAGE_ML_DIR / "processed_dataset.csv",
-        SCRIPT_DIR / "qc_final_merged_dataset.csv",
-        SCRIPT_DIR / "sample-data" / "qc_final_merged_dataset.csv",
-    ]
-
-    for candidate in candidates:
-        if candidate.exists():
-            return candidate
-
-    return candidates[0]
-
-
-def default_model_path():
-    return SCRIPT_DIR / "qc_energy_model_final.pkl"
-
-
-def default_metrics_path():
-    return SCRIPT_DIR / "generated_metrics.json"
-
-
-
-
 def read_rows(dataset_path):
     with open(dataset_path, newline="", encoding="utf-8") as file:
-        reader = csv.DictReader(file)
-        rows = []
-        for row in reader:
-            parsed = {}
-            for key, value in row.items():
-                parsed[key] = float(value or 0)
-            rows.append(parsed)
+        rows = sorted(csv.DictReader(file), key=lambda row: (float(row["year"]), float(row["month"])))
 
+    valid_rows = []
+    expected = None
+    for row in rows:
+        try:
+            parsed = {key: float(value) for key, value in row.items()}
+            year, month = parsed["year"], parsed["month"]
+            required = ["consumption_kwh", "temperature", "humidity", "rainfall", "solar_irradiance", "peak_demand_kw"]
+            if (not year.is_integer() or not month.is_integer() or not 1 <= year <= 9999
+                    or not 1 <= month <= 12 or not all(math.isfinite(v) for v in parsed.values())
+                    or any(parsed[key] < 0 for key in required if key != "temperature")
+                    or parsed.get("is_complete", 1) != 1):
+                break
+        except (ValueError, TypeError, KeyError):
+            break
+        if expected and (int(year), int(month)) != expected:
+            break
+        valid_rows.append(parsed)
+        expected = next_period(int(year), int(month))
 
-    return add_derived_features(sorted(rows, key=lambda item: (item["year"], item["month"])))
-
-
+    return add_derived_features(valid_rows)
 
 
 def add_derived_features(rows):
@@ -88,17 +61,6 @@ def predict_row(model, row):
 
 
     return sum(coefficient * value for coefficient, value in zip(model["coefficients"], values))
-
-
-
-
-def next_period_from_today(today=None):
-    current_date = today or date.today()
-    month = current_date.month
-    year = current_date.year
-
-
-    return next_period(year, month)
 
 
 
@@ -145,16 +107,6 @@ def average_context_for_month(rows, target_month):
 
 
 
-def rows_before_period(rows, target_year, target_month):
-    return [
-        row.copy()
-        for row in rows
-        if (int(row["year"]), int(row["month"])) < (target_year, target_month)
-    ]
-
-
-
-
 def build_forecast_input(rows, target_year, target_month):
     context = average_context_for_month(rows, target_month)
     last_row = rows[-1]
@@ -180,28 +132,18 @@ def build_forecast_input(rows, target_year, target_month):
 
 
 def forecast_until_period(model, rows, target_year, target_month):
-    forecast_rows = rows_before_period(rows, target_year, target_month)
-    if len(forecast_rows) < 2:
-        forecast_rows = [row.copy() for row in rows]
-
-
-    while (int(forecast_rows[-1]["year"]), int(forecast_rows[-1]["month"])) < (target_year, target_month):
-        year, month = next_period(int(forecast_rows[-1]["year"]), int(forecast_rows[-1]["month"]))
-        forecast_input = build_forecast_input(forecast_rows, year, month)
-        prediction = float(predict_row(model, forecast_input))
-        forecast_rows.append({**forecast_input, "consumption_kwh": prediction})
-
-
-    return forecast_rows[-1]
-
-
+    # Keep the entry point, but never synthesize intervening actual months.
+    expected = next_period(int(rows[-1]["year"]), int(rows[-1]["month"]))
+    if (target_year, target_month) != expected:
+        raise ValueError("Only the immediate next dataset month can be forecast.")
+    forecast_input = build_forecast_input(rows, target_year, target_month)
+    return {**forecast_input, "consumption_kwh": float(predict_row(model, forecast_input))}
 
 
 def main():
-    dataset_path = Path(sys.argv[1]) if len(sys.argv) > 1 else default_dataset_path()
-    model_path = Path(sys.argv[2]) if len(sys.argv) > 2 else default_model_path()
-    metrics_path = Path(sys.argv[3]) if len(sys.argv) > 3 else default_metrics_path()
-    train_script_path = default_path("train_model.py")
+    if len(sys.argv) != 4:
+        raise ValueError("Explicit uploaded dataset, model, and metrics paths are required.")
+    dataset_path, model_path, metrics_path = map(Path, sys.argv[1:4])
 
 
     rows = read_rows(dataset_path)
@@ -209,36 +151,14 @@ def main():
         raise ValueError("At least 3 processed rows are required to predict the next month.")
 
 
-    if not os.path.exists(model_path):
-        model_path.parent.mkdir(parents=True, exist_ok=True)
-        metrics_path.parent.mkdir(parents=True, exist_ok=True)
-        subprocess.run(
-            [sys.executable, train_script_path, dataset_path, model_path, metrics_path],
-            check=True,
-            capture_output=True,
-            text=True,
-        )
+    with open(model_path, "rb") as model_file:
+        model = pickle.load(model_file)
 
-
-    try:
-        with open(model_path, "rb") as model_file:
-            model = pickle.load(model_file)
-    except Exception:
-        model_path.parent.mkdir(parents=True, exist_ok=True)
-        metrics_path.parent.mkdir(parents=True, exist_ok=True)
-        subprocess.run(
-            [sys.executable, train_script_path, dataset_path, model_path, metrics_path],
-            check=True,
-            capture_output=True,
-            text=True,
-        )
-        with open(model_path, "rb") as model_file:
-            model = pickle.load(model_file)
-
-
-    next_year, next_month = next_period_from_today()
+    next_year, next_month = next_period(int(rows[-1]["year"]), int(rows[-1]["month"]))
     forecast_row = forecast_until_period(model, rows, next_year, next_month)
     prediction = round(float(forecast_row["consumption_kwh"]), 2)
+    if not math.isfinite(prediction) or prediction < 0:
+        raise ValueError("The model did not produce a valid nonnegative consumption forecast.")
     previous = round(float(forecast_row["lag_1"]), 2)
     change_percent = round(((prediction - previous) / previous) * 100, 2) if previous else 0
     metrics = {}

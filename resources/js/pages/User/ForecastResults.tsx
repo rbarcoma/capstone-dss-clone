@@ -29,9 +29,11 @@ const monthNames = [
 
 export default function ForecastResults({
     latestForecast,
+    forecastTarget,
     forecastHistory = [],
 }: {
-    latestForecast?: ForecastResult;
+    latestForecast?: ForecastResult | null;
+    forecastTarget?: { year: number; month: number } | null;
     forecastHistory: ForecastResult[];
 }) {
     const [search, setSearch] = useState('');
@@ -110,14 +112,18 @@ export default function ForecastResults({
             <div>
                 <h1 className="text-2xl font-semibold">Forecast Results</h1>
                 <p className="text-sm text-muted-foreground">
-                    Next-month consumption prediction and forecast history.
+                    Dataset target: {forecastTarget ? `${monthNames[forecastTarget.month - 1]} ${forecastTarget.year}` : 'Complete actual data required'}. Forecasts advance only when complete actual data is available.
                 </p>
             </div>
 
             <div className="grid gap-4 md:grid-cols-3">
                 <StatCard
-                    title="Predicted Consumption"
-                    value={`${latestForecast?.predicted_consumption_kwh ?? 0} kWh`}
+                    title={latestForecast ? `Forecast: ${monthNames[latestForecast.month - 1]} ${latestForecast.year}` : 'No saved forecast'}
+                    value={
+                        latestForecast
+                            ? `${latestForecast.predicted_consumption_kwh} kWh`
+                            : 'No forecast'
+                    }
                     onInfoClick={() =>
                         setInfoModal(forecastInfo.predictedConsumption)
                     }

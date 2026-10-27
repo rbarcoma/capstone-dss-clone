@@ -82,12 +82,13 @@ class EnergyDss
 
     public static function generateForForecast(ForecastResult $forecast, ?int $userId = null, ?CarbonInterface $generatedAt = null): DssResult
     {
-        $latest = ProcessedRecord::query()
+        $history = ProcessedRecord::query()->whereRaw('(year * 12 + month) < ?', [$forecast->year * 12 + $forecast->month]);
+        $latest = (clone $history)
             ->orderByDesc('year')
             ->orderByDesc('month')
             ->first();
 
-        $average = (float) ProcessedRecord::avg('consumption_kwh');
+        $average = (float) $history->avg('consumption_kwh');
 
         $demand = self::classifyDemand(
             (float) $forecast->predicted_consumption_kwh,

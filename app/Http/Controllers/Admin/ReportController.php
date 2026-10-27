@@ -17,7 +17,7 @@ class ReportController extends Controller
     {
         return Inertia::render('Admin/Reports', [
             'reports' => Report::with('user:id,name')->latest()->get(),
-            'latestForecast' => ForecastResult::latest('predicted_at')->first(),
+            'latestForecast' => ForecastResult::latest('predicted_at')->latest('id')->first(),
             'latestDss' => DssResult::latest('updated_at')->first(),
         ]);
     }

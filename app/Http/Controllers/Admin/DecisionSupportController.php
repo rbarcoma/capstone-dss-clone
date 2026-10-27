@@ -29,7 +29,7 @@ class DecisionSupportController extends Controller
 
     public function generate(Request $request)
     {
-        $forecast = ForecastResult::latest('predicted_at')->first();
+        $forecast = ForecastResult::latest('predicted_at')->latest('id')->first();
         if (! $forecast) {
             return back()->with('error', 'Run a forecast before generating DSS recommendations.');
         }
