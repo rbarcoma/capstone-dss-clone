@@ -133,8 +133,9 @@ class DataManagementController extends Controller
         }
 
         if ($replaceExisting) {
-            ConsumptionRecord::truncate();
-            ClimateRecord::truncate();
+            // Keep replacement compatible with MySQL transactions.
+            ConsumptionRecord::query()->delete();
+            ClimateRecord::query()->delete();
         }
 
         $monthlyRows = $this->aggregateMonthlyRows($rows);

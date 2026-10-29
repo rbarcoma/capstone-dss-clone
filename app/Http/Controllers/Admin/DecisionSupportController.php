@@ -4,11 +4,10 @@ namespace App\Http\Controllers\Admin;
 
 use App\Http\Controllers\Controller;
 use App\Models\DssResult;
-use App\Models\ForecastResult;
-use App\Support\AuditLogger;
-use App\Support\EnergyDss;
+use App\Support\MlWorkflow;
 use Illuminate\Http\Request;
 use Inertia\Inertia;
+use RuntimeException;
 
 class DecisionSupportController extends Controller
 {
@@ -29,18 +28,18 @@ class DecisionSupportController extends Controller
 
     public function generate(Request $request)
     {
-        $forecast = ForecastResult::latest('predicted_at')->latest('id')->first();
-        if (! $forecast) {
-            return back()->with('error', 'Run a forecast before generating DSS recommendations.');
+        try {
+            // Uploads, manual generation and schedules share validation, caching
+            // and locking, including after reverting to a previously used dataset.
+            app(MlWorkflow::class)->predictAndGenerate(
+                $request->user()?->id,
+                'manual',
+                false,
+                refreshDssTimestamp: true,
+            );
+        } catch (RuntimeException $exception) {
+            return back()->with('error', $exception->getMessage());
         }
-
-        $dss = EnergyDss::generateForForecast($forecast, $request->user()?->id, now());
-
-        AuditLogger::log(
-            'Decision Support',
-            'Generate DSS Result',
-            'Generated DSS result: ' . $dss->demand_status . ' and ' . $dss->readiness_level . '.'
-        );
 
         return back()->with('success', 'Decision support recommendations generated.');
     }

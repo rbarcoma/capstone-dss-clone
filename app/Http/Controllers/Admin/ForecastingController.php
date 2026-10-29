@@ -34,7 +34,11 @@ class ForecastingController extends Controller
     public function predict(Request $request)
     {
         try {
-            $result = app(MlWorkflow::class)->predictAndGenerate($request->user()?->id, 'manual');
+            $result = app(MlWorkflow::class)->predictAndGenerate(
+                $request->user()?->id,
+                'manual',
+                refreshForecastTimestamp: true,
+            );
         } catch (RuntimeException $exception) {
             return back()->with('error', $exception->getMessage());
         }

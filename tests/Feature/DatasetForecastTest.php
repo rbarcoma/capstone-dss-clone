@@ -1,18 +1,22 @@
 <?php
 
+use App\Models\AuditTrail;
 use App\Models\ClimateRecord;
 use App\Models\ConsumptionRecord;
 use App\Models\Dataset;
+use App\Models\DssResult;
 use App\Models\ForecastResult;
 use App\Models\ProcessedRecord;
 use App\Models\Report;
 use App\Models\User;
 use App\Support\AnalyticsData;
+use App\Support\EnergyDss;
 use App\Support\ForecastDataset;
 use App\Support\MlWorkflow;
 use Illuminate\Database\UniqueConstraintViolationException;
 use Illuminate\Http\UploadedFile;
 use Illuminate\Process\Factory;
+use Illuminate\Support\Facades\DB;
 use Illuminate\Support\Facades\Process;
 use Illuminate\Support\Facades\Storage;
 use Inertia\Testing\AssertableInertia as Assert;
@@ -387,3 +391,190 @@ it('keeps actuals visible without estimates when historical training or predicti
         ->and($analytics['summary']['average_consumption'])->toBe(1000.0)
         ->and(ForecastResult::count())->toBe(0);
 })->with(['training', 'prediction', 'periods', 'value']);
+
+it('refreshes the existing DSS timestamp and redirected table on every generate click', function () {
+    $this->travelTo(now()->startOfSecond());
+    $owner = User::factory()->create(['role' => 'admin']);
+    $first = app(MlWorkflow::class)->predictAndGenerate($owner->id);
+    $original = $first['dss']->getAttributes();
+    $this->actingAs(User::factory()->create(['role' => 'admin']));
+    foreach (range(1, 3) as $attempt) {
+        $this->travel(7)->seconds();
+        $clickedAt = now();
+        $this->followingRedirects()->from(route('admin.decision-support'))
+            ->post(route('admin.decision-support.generate'))
+            ->assertInertia(fn (Assert $page) => $page
+                ->component('Admin/DecisionSupport')
+                ->has('history', 1)
+                ->where('history.0.id', $first['dss']->id)
+                ->where('history.0.updated_at', $clickedAt->toISOString())
+                ->where('latestDss.updated_at', $clickedAt->toISOString()));
+        $current = DssResult::sole();
+        expect($current->updated_at->equalTo($clickedAt))->toBeTrue()
+            ->and(array_diff_key($current->getAttributes(), ['updated_at' => true]))
+            ->toEqual(array_diff_key($original, ['updated_at' => true]));
+    }
+    expect($first['forecast']->fresh()->predicted_at->equalTo($first['forecast']->predicted_at))->toBeTrue()
+        ->and(ForecastResult::count())->toBe(1)
+        ->and(Report::count())->toBe(1)
+        ->and(DB::table('dss_result_revisions')->count())->toBe(0)
+        ->and(AuditTrail::where('action', 'Refresh DSS Timestamp')->count())->toBe(3);
+    Process::assertRanTimes(fn () => true, 2);
+});
+
+it('refreshes the existing prediction timestamp and redirected table on every predict click', function () {
+    $this->travelTo(now()->startOfSecond());
+    $owner = User::factory()->create(['role' => 'admin']);
+    $first = app(MlWorkflow::class)->predictAndGenerate($owner->id);
+    $original = $first['forecast']->getAttributes();
+    $this->actingAs(User::factory()->create(['role' => 'admin']));
+    foreach (range(1, 3) as $attempt) {
+        $this->travel(7)->seconds();
+        $clickedAt = now();
+        $this->followingRedirects()->from(route('admin.forecasting'))
+            ->post(route('admin.forecasting.predict'))
+            ->assertInertia(fn (Assert $page) => $page
+                ->component('Admin/Forecasting')
+                ->has('forecastHistory', 1)
+                ->where('forecastHistory.0.id', $first['forecast']->id)
+                ->where('forecastHistory.0.predicted_at', $clickedAt->toISOString())
+                ->where('latestForecast.predicted_at', $clickedAt->toISOString()));
+        $current = ForecastResult::sole();
+        expect($current->predicted_at->equalTo($clickedAt))->toBeTrue()
+            ->and(array_diff_key($current->getAttributes(), ['predicted_at' => true, 'updated_at' => true]))
+            ->toEqual(array_diff_key($original, ['predicted_at' => true, 'updated_at' => true]));
+    }
+    expect($first['dss']->fresh()->updated_at->equalTo($first['dss']->updated_at))->toBeTrue()
+        ->and(DssResult::count())->toBe(1)
+        ->and(Report::count())->toBe(1)
+        ->and(DB::table('dss_result_revisions')->count())->toBe(0)
+        ->and(AuditTrail::where('action', 'Refresh Prediction Timestamp')->count())->toBe(3);
+    Process::assertRanTimes(fn () => true, 2);
+});
+
+it('reuses DSS forecasts and reports when identical records are reuploaded or replaced', function () {
+    $this->actingAs(User::factory()->create(['role' => 'admin']));
+    $contents = Storage::get(Dataset::first()->path);
+    $this->post(route('admin.data-management.store'), [
+        'dataset' => UploadedFile::fake()->createWithContent('dataset.csv', $contents),
+    ])->assertSessionHas('success');
+    $original = DssResult::sole()->getAttributes();
+    $hash = ForecastDataset::snapshot()['dataset_hash'];
+    $this->travel(1)->hours();
+    foreach (['dataset.csv', 'renamed.csv'] as $name) {
+        $lines = explode("\n", trim($contents));
+        $header = array_shift($lines);
+        $equivalent = $header."\n".implode("\n", array_reverse($lines));
+        $this->post(route('admin.data-management.store'), [
+            'dataset' => UploadedFile::fake()->createWithContent($name, str_replace(',1000,', ',1000.00,', $equivalent)),
+        ])->assertSessionHas('success');
+    }
+    $this->post(route('admin.data-management.store'), [
+        'dataset' => UploadedFile::fake()->createWithContent('renamed.csv', $contents),
+        'replace_existing' => true,
+    ])->assertSessionHas('success');
+    expect(DssResult::sole()->getAttributes())->toBe($original)
+        ->and(ForecastDataset::snapshot()['dataset_hash'])->toBe($hash)
+        ->and(ForecastResult::count())->toBe(1)
+        ->and(Report::count())->toBe(1)
+        ->and(DB::table('dss_result_revisions')->count())->toBe(0);
+    Process::assertRanTimes(fn () => true, 2);
+});
+
+it('updates the same monthly DSS and retains history when its input data changes', function () {
+    $first = app(MlWorkflow::class)->predictAndGenerate();
+    $original = $first['dss']->getAttributes();
+    $this->travel(1)->hours();
+    ConsumptionRecord::where('month', 9)->update(['consumption_kwh' => 1200]);
+    ProcessedRecord::where('month', 9)->update(['consumption_kwh' => 1200]);
+    $second = app(MlWorkflow::class)->runAfterDatasetUpload();
+    expect($second['dss']->id)->toBe($first['dss']->id)
+        ->and($second['dss']->forecast_result_id)->toBe($second['forecast']->id)
+        ->and($second['dss']->created_at->equalTo($first['dss']->created_at))->toBeTrue()
+        ->and($second['dss']->updated_at->gt($first['dss']->updated_at))->toBeTrue()
+        ->and($second['dss']->basis['average_consumption_kwh'])->toBeGreaterThan(1000)
+        ->and(DssResult::count())->toBe(1)
+        ->and(json_decode(DB::table('dss_result_revisions')->sole()->snapshot, true))->toEqual($original)
+        ->and($first['report']->fresh()->summary['latest_dss']['forecast_result_id'])->toBe($first['forecast']->id)
+        ->and(AuditTrail::where('action', 'Update DSS Result')->count())->toBe(1);
+    app(MlWorkflow::class)->runScheduledMonthlyPrediction();
+    expect(DB::table('dss_result_revisions')->count())->toBe(1);
+});
+
+it('restores the existing monthly DSS when inputs revert to an older cached forecast', function () {
+    $workflow = app(MlWorkflow::class);
+    $first = $workflow->predictAndGenerate();
+    ConsumptionRecord::where('month', 9)->update(['consumption_kwh' => 1200]);
+    ProcessedRecord::where('month', 9)->update(['consumption_kwh' => 1200]);
+    $workflow->predictAndGenerate();
+    ConsumptionRecord::where('month', 9)->update(['consumption_kwh' => 1000]);
+    ProcessedRecord::where('month', 9)->update(['consumption_kwh' => 1000]);
+    $this->actingAs(User::factory()->create(['role' => 'admin']))
+        ->post(route('admin.decision-support.generate'))->assertSessionHas('success');
+    expect(DssResult::sole()->id)->toBe($first['dss']->id)
+        ->and(DssResult::sole()->forecast_result_id)->toBe($first['forecast']->id)
+        ->and(DB::table('dss_result_revisions')->count())->toBe(2);
+    Process::assertRanTimes(fn () => true, 4);
+});
+
+it('creates a separate DSS only for a new forecast year and month', function () {
+    $first = app(MlWorkflow::class)->predictAndGenerate();
+    forecastActual(2026, 10);
+    Process::fake(function ($process) {
+        if ($process->command[1] === 'train_model.py') {
+            file_put_contents($process->command[3], 'model');
+            file_put_contents($process->command[4], '{}');
+
+            return Process::result(output: 'Trained');
+        }
+
+        return Process::result(output: '{"year":2026,"month":11,"predicted_consumption_kwh":1200}');
+    });
+    $second = app(MlWorkflow::class)->runScheduledMonthlyPrediction();
+    expect($second['dss']->id)->not->toBe($first['dss']->id)
+        ->and($second['dss']->forecast_month)->toBe(11)
+        ->and(DssResult::count())->toBe(2)
+        ->and($first['dss']->fresh()->forecast_month)->toBe(10)
+        ->and(DB::table('dss_result_revisions')->count())->toBe(0);
+});
+
+it('enforces monthly DSS uniqueness at the database level', function () {
+    $first = app(MlWorkflow::class)->predictAndGenerate();
+    $values = $first['dss']->getAttributes();
+    unset($values['id'], $values['current_slot']);
+    DB::table('dss_results')->insert([...$values, 'forecast_year' => 2027]);
+    expect(DssResult::count())->toBe(2);
+    $this->expectException(UniqueConstraintViolationException::class);
+    DB::table('dss_results')->insert($values);
+});
+
+it('repairs a missing monthly DSS for a cached forecast', function () {
+    $first = app(MlWorkflow::class)->predictAndGenerate();
+    $first['dss']->delete();
+    $repaired = app(MlWorkflow::class)->predictAndGenerate();
+    expect($repaired['dss'])->toBeInstanceOf(DssResult::class)
+        ->and($repaired['dss']->forecast_result_id)->toBe($first['forecast']->id)
+        ->and(DssResult::count())->toBe(1);
+    Process::assertRanTimes(fn () => true, 2);
+});
+
+it('does not generate DSS from stale preprocessing', function () {
+    $first = app(MlWorkflow::class)->predictAndGenerate();
+    $original = $first['dss']->getAttributes();
+    ClimateRecord::where('month', 9)->update(['temperature' => 30]);
+    $this->actingAs(User::factory()->create(['role' => 'admin']))
+        ->post(route('admin.decision-support.generate'))->assertSessionHas('error');
+    expect(DssResult::sole()->getAttributes())->toBe($original);
+});
+
+it('retains a legacy DSS identity when generating from the content-based fingerprint', function () {
+    $forecast = ForecastResult::create(['year' => 2026, 'month' => 10, 'predicted_consumption_kwh' => 900]);
+    $legacy = EnergyDss::generateForForecast($forecast);
+    $this->actingAs(User::factory()->create(['role' => 'admin']))
+        ->post(route('admin.decision-support.generate'))->assertSessionHas('success');
+    expect(DssResult::sole()->id)->toBe($legacy->id)
+        ->and(DssResult::sole()->forecast_result_id)->not->toBe($forecast->id)
+        ->and($forecast->fresh()->predicted_consumption_kwh)->toEqual(900)
+        ->and(DB::table('dss_result_revisions')->count())->toBe(1)
+        ->and(Report::count())->toBe(0);
+});

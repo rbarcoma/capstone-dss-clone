@@ -1,3 +1,6 @@
+import { router, usePage } from '@inertiajs/react';
+import { Info, Search } from 'lucide-react';
+import { useMemo, useState } from 'react';
 import { Button } from '@/components/ui/button';
 import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card';
 import {
@@ -8,9 +11,6 @@ import {
 } from '@/components/ui/dialog';
 import { Input } from '@/components/ui/input';
 import type { DssResult } from '@/types';
-import { router, usePage } from '@inertiajs/react';
-import { Info, Search } from 'lucide-react';
-import { useMemo, useState } from 'react';
 
 const monthNames = [
     'January',
@@ -122,7 +122,13 @@ export default function DecisionSupport({
                     </p>
                 </div>
 
-                <Button onClick={() => router.post('/admin/decision-support/generate')}>
+                <Button
+                    onClick={() =>
+                        router.post('/admin/decision-support/generate', {}, {
+                            onSuccess: () => setCurrentPage(1),
+                        })
+                    }
+                >
                     Generate DSS Result
                 </Button>
             </div>

@@ -68,13 +68,27 @@ class ForecastDataset
             'year' => $expected->year,
             'month' => $expected->month,
             'dataset_hash' => hash('sha256', json_encode([
-                'uploaded-dataset-v1',
-                $actuals->map->only(['dataset_id', 'year', 'month', 'consumption_kwh', 'peak_demand_kw', 'is_complete'])->all(),
-                $sourceRows,
-                $processed->map->only(self::FIELDS)->all(),
+                'uploaded-content-v2',
+                // Use effective data, not upload IDs, names or number formatting.
+                $actuals->map(function ($actual) use (&$sourceRows, $climate) {
+                    $sourceRows[$actual->dataset_id] ??= self::sourceRows($actual->dataset_id);
+                    $period = "$actual->year-$actual->month";
+
+                    return [
+                        self::numericValues($actual, ['year', 'month', 'consumption_kwh', 'peak_demand_kw']),
+                        self::numericValues($climate->get($period), ['temperature', 'humidity', 'rainfall', 'solar_irradiance']),
+                        $actual->is_complete !== false && MonthlyDataQuality::isComplete($sourceRows[$actual->dataset_id][$period] ?? []),
+                    ];
+                })->all(),
+                $processed->map(fn ($row) => self::numericValues($row, self::FIELDS))->all(),
                 $eligible->map->only(['year', 'month'])->all(),
             ], JSON_THROW_ON_ERROR)),
         ];
+    }
+
+    private static function numericValues($record, array $fields): array
+    {
+        return array_map(fn ($field) => is_numeric($record?->{$field}) ? (float) $record->{$field} : null, $fields);
     }
 
     public static function target(): ?array

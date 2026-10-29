@@ -2,7 +2,6 @@
 
 namespace App\Support;
 
-use App\Models\DssResult;
 use App\Models\ForecastResult;
 use App\Models\Report;
 use Illuminate\Support\Collection;
@@ -135,14 +134,19 @@ class MlWorkflow
         ];
     }
 
-    public function predictAndGenerate(?int $userId = null, string $source = 'manual', bool $generateReport = true): array
-    {
-        return Cache::lock('dataset-next-month-forecast', 180)->block(5, function () use ($userId, $source, $generateReport) {
-            return $this->generatePrediction($userId, $source, $generateReport);
+    public function predictAndGenerate(
+        ?int $userId = null,
+        string $source = 'manual',
+        bool $generateReport = true,
+        bool $refreshForecastTimestamp = false,
+        bool $refreshDssTimestamp = false,
+    ): array {
+        return Cache::lock('dataset-next-month-forecast', 180)->block(5, function () use ($userId, $source, $generateReport, $refreshForecastTimestamp, $refreshDssTimestamp) {
+            return $this->generatePrediction($userId, $source, $generateReport, $refreshForecastTimestamp, $refreshDssTimestamp);
         });
     }
 
-    private function generatePrediction(?int $userId, string $source, bool $generateReport): array
+    private function generatePrediction(?int $userId, string $source, bool $generateReport, bool $refreshForecastTimestamp, bool $refreshDssTimestamp): array
     {
         $snapshot = ForecastDataset::snapshot();
         if ($snapshot['records']->count() < 6) {
@@ -153,11 +157,26 @@ class MlWorkflow
         $identity = array_intersect_key($snapshot, array_flip(['dataset_hash', 'year', 'month']));
         $existing = ForecastResult::where($identity)->first();
         if ($existing) {
-            return [
-                'forecast' => $existing,
-                'dss' => DssResult::where('forecast_result_id', $existing->id)->first(),
-                'report' => Report::where('summary->latest_forecast->id', $existing->id)->latest('id')->first(),
-            ];
+            return DB::transaction(function () use ($existing, $userId, $source, $generateReport, $refreshForecastTimestamp, $refreshDssTimestamp) {
+                $generatedAt = now();
+                if ($refreshForecastTimestamp) {
+                    $existing->forceFill(['predicted_at' => $generatedAt])->save();
+                    AuditLogger::log(
+                        'Forecasting',
+                        'Refresh Prediction Timestamp',
+                        'Refreshed prediction timestamp for existing forecast #'.$existing->id.'.'
+                    );
+                }
+
+                return [
+                    'forecast' => $existing,
+                    'dss' => EnergyDss::generateForForecast($existing, $userId, $generatedAt, $refreshDssTimestamp),
+                    'report' => $generateReport
+                        ? (Report::where('summary->latest_forecast->id', $existing->id)->latest('id')->first()
+                            ?? ReportGenerator::create($userId, $source, $existing))
+                        : null,
+                ];
+            });
         }
 
         // Use an immutable snapshot so simultaneous exports cannot change prediction input.
@@ -191,7 +210,7 @@ class MlWorkflow
             throw new RuntimeException('The uploaded dataset changed during forecasting. Generate the forecast again.');
         }
 
-        return DB::transaction(function () use ($identity, $data, $userId, $generatedAt, $generateReport, $source) {
+        return DB::transaction(function () use ($identity, $data, $userId, $generatedAt, $generateReport, $source, $refreshDssTimestamp) {
             $forecast = ForecastResult::firstOrCreate($identity, [
                 'user_id' => $userId,
                 'predicted_at' => $generatedAt,
@@ -204,7 +223,7 @@ class MlWorkflow
                 'model_type' => $data['model_type'] ?? 'Linear Regression',
             ]);
 
-            $dss = EnergyDss::generateForForecast($forecast, $userId, $generatedAt);
+            $dss = EnergyDss::generateForForecast($forecast, $userId, $generatedAt, $refreshDssTimestamp);
             $report = $generateReport ? ReportGenerator::create($userId, $source, $forecast) : null;
 
             AuditLogger::log(
@@ -214,12 +233,6 @@ class MlWorkflow
                     $forecast->year.'-'.
                     str_pad((string) $forecast->month, 2, '0', STR_PAD_LEFT).
                     ': '.$forecast->predicted_consumption_kwh.' kWh.'
-            );
-
-            AuditLogger::log(
-                'Decision Support',
-                $source === 'manual' ? 'Auto Generate DSS Result' : 'System Generate DSS Result',
-                'Generated DSS result: '.$dss->demand_status.' and '.$dss->readiness_level.'.'
             );
 
             if ($report instanceof Report) {

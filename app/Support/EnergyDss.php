@@ -6,6 +6,7 @@ use App\Models\DssResult;
 use App\Models\ForecastResult;
 use App\Models\ProcessedRecord;
 use Carbon\CarbonInterface;
+use Illuminate\Support\Facades\DB;
 
 class EnergyDss
 {
@@ -80,15 +81,12 @@ class EnergyDss
         return [$items, $actions];
     }
 
-    public static function generateForForecast(ForecastResult $forecast, ?int $userId = null, ?CarbonInterface $generatedAt = null): DssResult
+    public static function generateForForecast(ForecastResult $forecast, ?int $userId = null, ?CarbonInterface $generatedAt = null, bool $refreshTimestamp = false): DssResult
     {
         $history = ProcessedRecord::query()->whereRaw('(year * 12 + month) < ?', [$forecast->year * 12 + $forecast->month]);
-        $latest = (clone $history)
-            ->orderByDesc('year')
-            ->orderByDesc('month')
-            ->first();
-
-        $average = (float) $history->avg('consumption_kwh');
+        $records = $history->orderBy('year')->orderBy('month')->get();
+        $latest = $records->last();
+        $average = (float) $records->avg('consumption_kwh');
 
         $demand = self::classifyDemand(
             (float) $forecast->predicted_consumption_kwh,
@@ -108,9 +106,25 @@ class EnergyDss
             $readiness
         );
 
-        $dss = DssResult::updateOrCreate([
+        $inputHash = hash('sha256', json_encode([
+            'dss-v1',
+            $forecast->dataset_hash,
+            (int) $forecast->year,
+            (int) $forecast->month,
+            (float) $forecast->predicted_consumption_kwh,
+            (float) $forecast->change_percent,
+            $records->map(fn ($row) => array_map(
+                fn ($field) => (float) $row->{$field}, ForecastDataset::FIELDS
+            ))->all(),
+        ], JSON_THROW_ON_ERROR));
+        $identity = [
+            'forecast_year' => $forecast->year,
+            'forecast_month' => $forecast->month,
+        ];
+        $generatedAt ??= now();
+        $values = [
             'forecast_result_id' => $forecast->id,
-        ], [
+            'input_hash' => $inputHash,
             'user_id' => $userId,
             'demand_status' => $demand,
             'readiness_level' => $readiness,
@@ -122,14 +136,39 @@ class EnergyDss
                 'peak_demand_kw' => (float) ($latest?->peak_demand_kw ?? 0),
                 'solar_irradiance' => (float) ($latest?->solar_irradiance ?? 0),
             ],
-        ]);
-
-        $generatedAt ??= now();
-
-        $dss->forceFill([
             'updated_at' => $generatedAt,
-        ])->saveQuietly();
+        ];
 
-        return $dss->refresh();
+        return DB::transaction(function () use ($identity, $values, $generatedAt, $refreshTimestamp) {
+            // Uniqueness protects simultaneous first requests; the row lock
+            // serializes updates to the same month across forecast versions.
+            $candidate = DssResult::query()->createOrFirst($identity, $values);
+            $dss = DssResult::query()->lockForUpdate()->findOrFail($candidate->id);
+            $action = 'Reuse DSS Result';
+            if ($candidate->wasRecentlyCreated) {
+                $action = 'Generate DSS Result';
+            } elseif ($dss->input_hash !== $values['input_hash'] || $dss->forecast_result_id !== $values['forecast_result_id']) {
+                DB::table('dss_result_revisions')->insert([
+                    'dss_result_id' => $dss->id,
+                    'snapshot' => json_encode($dss->getAttributes(), JSON_THROW_ON_ERROR),
+                    'recorded_at' => $generatedAt,
+                ]);
+                $dss->forceFill($values)->save();
+                $action = 'Update DSS Result';
+            } elseif ($refreshTimestamp) {
+                $dss->forceFill(['updated_at' => $generatedAt])->save();
+                $action = 'Refresh DSS Timestamp';
+            }
+
+            AuditLogger::log(
+                'Decision Support',
+                $action,
+                $action.' #'.$dss->id.' for '.
+                    $identity['forecast_year'].'-'.str_pad((string) $identity['forecast_month'], 2, '0', STR_PAD_LEFT).
+                    ': '.$dss->demand_status.' and '.$dss->readiness_level.'.'
+            );
+
+            return $dss->refresh();
+        }, 3);
     }
 }

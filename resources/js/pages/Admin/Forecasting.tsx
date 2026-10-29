@@ -1,9 +1,3 @@
-import { StatCard } from '@/components/dss/stat-card';
-import { Button } from '@/components/ui/button';
-import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card';
-import { Dialog, DialogContent, DialogHeader, DialogTitle } from '@/components/ui/dialog';
-import { Input } from '@/components/ui/input';
-import type { ForecastResult } from '@/types';
 import { router, usePage } from '@inertiajs/react';
 import {
     Brain,
@@ -14,6 +8,12 @@ import {
     Target,
 } from 'lucide-react';
 import { useEffect, useMemo, useState } from 'react';
+import { StatCard } from '@/components/dss/stat-card';
+import { Button } from '@/components/ui/button';
+import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card';
+import { Dialog, DialogContent, DialogHeader, DialogTitle } from '@/components/ui/dialog';
+import { Input } from '@/components/ui/input';
+import type { ForecastResult } from '@/types';
 
 const monthNames = [
     'January',
@@ -124,7 +124,7 @@ export default function Forecasting({
 
         return new Intl.DateTimeFormat('en-PH', {
             dateStyle: 'medium',
-            timeStyle: 'short',
+            timeStyle: 'medium',
         }).format(new Date(value));
     };
 
@@ -212,7 +212,11 @@ export default function Forecasting({
 
                     <Button
                         disabled={isTraining || !forecastTarget}
-                        onClick={() => router.post('/admin/forecasting/predict')}
+                        onClick={() =>
+                            router.post('/admin/forecasting/predict', {}, {
+                                onSuccess: () => setCurrentPage(1),
+                            })
+                        }
                     >
                         Predict Next Month
                     </Button>

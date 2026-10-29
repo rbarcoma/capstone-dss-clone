@@ -2,8 +2,8 @@ import { Button } from '@/components/ui/button';
 import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card';
 import { Input } from '@/components/ui/input';
 import type { Dataset } from '@/types';
-import { router, useForm, usePage } from '@inertiajs/react';
-import { Search, Trash2, Upload } from 'lucide-react';
+import { useForm, usePage } from '@inertiajs/react';
+import { Search, Upload } from 'lucide-react';
 import { useMemo, useState } from 'react';
 import { toast } from 'sonner';
 
@@ -17,10 +17,6 @@ export default function DataManagement({
     const { auth, flash } = usePage().props as any;
 
     const [openUploadModal, setOpenUploadModal] = useState(false);
-    const [openDeleteModal, setOpenDeleteModal] = useState(false);
-    const [selectedDataset, setSelectedDataset] = useState<Dataset | null>(null);
-    const [deletePassword, setDeletePassword] = useState('');
-    const [deleteError, setDeleteError] = useState('');
 
     const [search, setSearch] = useState('');
     const [currentPage, setCurrentPage] = useState(1);
@@ -98,32 +94,6 @@ export default function DataManagement({
         });
     };
 
-    const openDeleteConfirmation = (dataset: Dataset) => {
-        setSelectedDataset(dataset);
-        setDeletePassword('');
-        setDeleteError('');
-        setOpenDeleteModal(true);
-    };
-
-    const confirmDelete = () => {
-        if (!selectedDataset) return;
-
-        router.delete(`/admin/data-management/${selectedDataset.id}`, {
-            data: {
-                password: deletePassword,
-            },
-            onSuccess: () => {
-                setOpenDeleteModal(false);
-                setSelectedDataset(null);
-                setDeletePassword('');
-                setDeleteError('');
-            },
-            onError: (errors) => {
-                setDeleteError(errors.password ?? 'Unable to delete dataset.');
-            },
-        });
-    };
-
     return (
         <div className="space-y-6 p-6">
             <div className="flex items-center justify-between gap-4">
@@ -197,7 +167,6 @@ export default function DataManagement({
                                 <th className="px-3 py-3 font-semibold">Uploaded At</th>
                                 <th className="px-3 py-3 font-semibold">Status</th>
                                 <th className="px-3 py-3 font-semibold">Records</th>
-                                <th className="px-3 py-3 text-right font-semibold">Action</th>
                             </tr>
                         </thead>
 
@@ -225,24 +194,13 @@ export default function DataManagement({
                                             </td>
                                             <td className="px-3 py-1">{item.status}</td>
                                             <td className="px-3 py-1">{item.record_count}</td>
-                                            <td className="px-3 py-1">
-                                                <div className="flex justify-end">
-                                                    <Button
-                                                        variant="destructive"
-                                                        size="icon"
-                                                        onClick={() => openDeleteConfirmation(item)}
-                                                    >
-                                                        <Trash2 className="h-4 w-4" />
-                                                    </Button>
-                                                </div>
-                                            </td>
                                         </tr>
                                     );
                                 })
                             ) : (
                                 <tr>
                                     <td
-                                        colSpan={7}
+                                        colSpan={6}
                                         className="px-3 py-8 text-center text-muted-foreground"
                                     >
                                         No datasets found.
@@ -350,77 +308,6 @@ export default function DataManagement({
                                 </Button>
                             </div>
                         </form>
-                    </div>
-                </div>
-            )}
-
-            {openDeleteModal && selectedDataset && (
-                <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/50 px-4">
-                    <div className="w-full max-w-md rounded-xl bg-white p-6 shadow-lg">
-                        <div className="mb-5 flex items-center justify-between">
-                            <h2 className="text-xl font-semibold text-red-600">
-                                Confirm Delete
-                            </h2>
-
-                            <button
-                                type="button"
-                                onClick={() => {
-                                    setOpenDeleteModal(false);
-                                    setSelectedDataset(null);
-                                    setDeletePassword('');
-                                    setDeleteError('');
-                                }}
-                                className="rounded-md px-2 py-1 text-xl text-gray-500 hover:bg-gray-100"
-                            >
-                                ×
-                            </button>
-                        </div>
-
-                        <p className="text-sm text-muted-foreground">
-                            Are you sure you want to delete{' '}
-                            <span className="font-semibold text-black">
-                                {selectedDataset.original_name}
-                            </span>
-                            ? Enter your password to confirm.
-                        </p>
-
-                        <div className="mt-5">
-                            <Input
-                                type="password"
-                                placeholder="Enter your password"
-                                value={deletePassword}
-                                onChange={(event) => {
-                                    setDeletePassword(event.target.value);
-                                    setDeleteError('');
-                                }}
-                            />
-                            {deleteError && (
-                                <p className="mt-2 text-sm text-red-600">{deleteError}</p>
-                            )}
-                        </div>
-
-                        <div className="mt-6 flex justify-end gap-2">
-                            <Button
-                                type="button"
-                                variant="outline"
-                                onClick={() => {
-                                    setOpenDeleteModal(false);
-                                    setSelectedDataset(null);
-                                    setDeletePassword('');
-                                    setDeleteError('');
-                                }}
-                            >
-                                Cancel
-                            </Button>
-
-                            <Button
-                                variant="destructive"
-                                disabled={!deletePassword}
-                                onClick={confirmDelete}
-                            >
-                                Delete Dataset
-                            </Button>
-                        </div>
                     </div>
                 </div>
             )}
